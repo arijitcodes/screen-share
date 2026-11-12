@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screen Share</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; min-height: 100dvh; background: #111; color: #eee; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 16px; box-sizing: border-box; text-align: center; }
+  h2 { margin: 0; font-weight: 600; }
+  button { background: #5865f2; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-size: 15px; cursor: pointer; }
+  button:hover { filter: brightness(1.12); }
+  button.stop { background: #d83c3e; }
+  input, select { background: #222; color: #eee; border: 1px solid #444; border-radius: 8px; padding: 9px; font-size: 14px; }
+  input { width: min(460px, 90vw); }
+  video { width: min(1280px, 96vw); max-height: 80dvh; background: #000; border-radius: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  .hint { color: #888; font-size: 13px; margin: 0; }
+  #status { color: #aaa; font-size: 14px; min-height: 1.2em; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+  <h2 id="title">Screen Share</h2>
+  <div id="landing" class="hidden"><button id="create">Create room</button></div>
+
+  <div id="host" class="hidden">
+    <div class="row"><input id="link"><button id="copy">Copy link</button></div>
+    <div class="row">
+      <label class="hint" for="max">Max viewers</label>
+      <select id="max"><option>1</option><option>2</option><option>3</option><option>4</option><option value="custom">Custom…</option></select>
+      <input id="maxcustom" class="hidden" type="number" min="1" max="50" value="5" style="width:70px">
+      <button id="share">Start sharing</button>
+      <button id="stop" class="stop hidden">Stop</button>
+    </div>
+    <p class="hint" style="margin-top:10px">Pick <b>Entire screen</b> and tick <b>Share system audio</b>.</p>
+  </div>
+
+  <div id="viewer" class="hidden">
+    <button id="join">Join &amp; watch</button>
+    <p class="hint" style="margin-top:10px">Click to join, it also enables sound.</p>
+  </div>
+
+  <video id="vid" class="hidden" autoplay playsinline controls></video>
+  <div id="status"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const status = (t) => ($('status').textContent = t);
+const show = (id) => $(id).classList.remove('hidden');
+const hide = (id) => $(id).classList.add('hidden');
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+
+// Stereo + high-bitrate Opus so system audio doesn't sound like a phone call.
+const hifi = (sdp) => sdp.replace(/(a=fmtp:\d+ [^\r\n]*useinbandfec=1)/g, '$1;stereo=1;sprop-stereo=1;maxaveragebitrate=510000');
+
+const m = location.pathname.match(/^\/r\/([0-9a-f-]{36})$/);
+const room = m && m[1];
+const isHost = !!room && location.hash === '#host';
+
+function connect(role) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return new WebSocket(`${proto}://${location.host}/?room=${room}&role=${role}`);
+}
+
+if (!room) {
+  show('landing');
+  $('create').onclick = () => { location.href = `/r/${crypto.randomUUID()}#host`; };
+} else if (isHost) {
+  $('title').textContent = 'Hosting';
+  show('host');
+  $('link').value = `${location.origin}/r/${room}`;
+  if (['localhost', '127.0.0.1'].includes(location.hostname)) {
+    fetch('/lan').then((r) => r.json()).then((ips) => {
+      const ip = ips.find((i) => i.startsWith('192.168.')) || ips[0];
+      if (ip) $('link').value = `http://${ip}:${location.port || 80}/r/${room}`;
+    }).catch(() => {});
+  }
+  $('copy').onclick = () => {
+    navigator.clipboard.writeText($('link').value);
+    $('copy').textContent = 'Copied!';
+    setTimeout(() => ($('copy').textContent = 'Copy link'), 1500);
+  };
+  runHost();
+} else {
+  $('title').textContent = 'Watching';
+  show('viewer');
+  $('join').onclick = runViewer;
+}
+
+function runHost() {
+  const ws = connect('host');
+  const viewers = new Set();
+  const peers = new Map();
+  let stream = null;
+  let warn = '';
+  const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
+  const refresh = () => status(warn || (stream
+    ? `Sharing to ${viewers.size} viewer(s)`
+    : viewers.size ? `${viewers.size} viewer(s) in the room. Click Start sharing.` : 'Waiting for your friend to open the link…'));
+  const sendMax = () => {
+    const custom = $('max').value === 'custom';
+    $('maxcustom').classList.toggle('hidden', !custom);
+    send({ type: 'max', n: +(custom ? $('maxcustom').value : $('max').value) });
+  };
+  ws.onopen = sendMax;
+  $('max').onchange = sendMax;
+  $('maxcustom').oninput = sendMax;
+  ws.onclose = () => { warn = warn || 'Lost connection to the server. Refresh to retry.'; refresh(); };
+  refresh();
+
+  async function callViewer(id) {
+    peers.get(id)?.close();
+    const pc = new RTCPeerConnection(ICE);
+    peers.set(id, pc);
+    pc.onicecandidate = (e) => e.candidate && send({ type: 'ice', to: id, candidate: e.candidate });
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed') { warn = 'A viewer could not connect (their network may block direct connections).'; refresh(); }
+      else if (pc.connectionState === 'connected') { warn = ''; refresh(); }
+    };
+    for (const t of stream.getTracks()) {
+      if (t.kind === 'video') pc.addTransceiver(t, { direction: 'sendonly', streams: [stream], sendEncodings: [{ maxBitrate: 8_000_000 }] });
+      else pc.addTrack(t, stream);
+    }
+    const offer = await pc.createOffer();
+    offer.sdp = hifi(offer.sdp);
+    await pc.setLocalDescription(offer);
+    send({ type: 'offer', to: id, sdp: pc.localDescription });
+  }
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'viewer-joined') { viewers.add(msg.id); refresh(); if (stream) callViewer(msg.id); }
+    else if (msg.type === 'viewer-left') { viewers.delete(msg.id); peers.get(msg.id)?.close(); peers.delete(msg.id); refresh(); }
+    else if (msg.type === 'answer') await peers.get(msg.from)?.setRemoteDescription(msg.sdp);
+    else if (msg.type === 'ice') await peers.get(msg.from)?.addIceCandidate(msg.candidate).catch(() => {});
+    else if (msg.type === 'error') { warn = msg.msg; refresh(); }
+  };
+
+  $('share').onclick = async () => {
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 60 },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
+      });
+    } catch { stream = null; return; }
+    const v = stream.getVideoTracks()[0];
+    v.contentHint = 'motion';
+    v.onended = stopSharing;
+    warn = stream.getAudioTracks().length ? '' : 'Sharing WITHOUT audio. Stop and re-share with "Share system audio" ticked.';
+    hide('share'); show('stop');
+    refresh();
+    viewers.forEach(callViewer);
+  };
+
+  function stopSharing() {
+    if (!stream) return;
+    send({ type: 'stopped' });
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null; warn = '';
+    peers.forEach((p) => p.close()); peers.clear();
+    hide('stop'); show('share');
+    refresh();
+  }
+  $('stop').onclick = stopSharing;
+}
+
+function runViewer() {
+  hide('viewer');
+  const ws = connect('viewer');
+  let pc;
+  let ended = false;
+  const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
+  status('Connecting…');
+  ws.onopen = () => status('Connected. Waiting for the host to start sharing…');
+  ws.onclose = () => { if (!ended) status('Disconnected. Refresh to rejoin.'); };
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'waiting') status("Connected. The host hasn't opened the room yet, waiting…");
+    else if (msg.type === 'full') { ended = true; status('This room is full.'); }
+    else if (msg.type === 'stopped') { status('The host stopped sharing. Waiting for them to start again…'); pc?.close(); $('vid').srcObject = null; hide('vid'); }
+    else if (msg.type === 'host-left') { status('The host closed the room.'); pc?.close(); $('vid').srcObject = null; hide('vid'); }
+    else if (msg.type === 'offer') {
+      pc?.close();
+      pc = new RTCPeerConnection(ICE);
+      pc.onicecandidate = (ev) => ev.candidate && send({ type: 'ice', to: 'host', candidate: ev.candidate });
+      pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') status('Could not connect. Your network may block direct connections.'); };
+      pc.ontrack = (ev) => {
+        const v = $('vid');
+        if (v.srcObject !== ev.streams[0]) v.srcObject = ev.streams[0];
+        show('vid'); v.play().catch(() => {}); status('');
+      };
+      await pc.setRemoteDescription(msg.sdp);
+      const ans = await pc.createAnswer();
+      ans.sdp = hifi(ans.sdp);
+      await pc.setLocalDescription(ans);
+      send({ type: 'answer', sdp: pc.localDescription });
+    } else if (msg.type === 'ice') await pc?.addIceCandidate(msg.candidate).catch(() => {});
+  };
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+services:
+  screen-share:
+    build: .
+    container_name: screen-share
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3000:3000" # only nginx on the host can reach it
+    mem_limit: 64m
