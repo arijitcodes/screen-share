@@ -4,6 +4,7 @@ services:
     build: .
     container_name: screen-share
     restart: unless-stopped
+    init: true # proper signal handling, so stop/restart is instant
     ports:
       - "127.0.0.1:3000:3000" # only nginx on the host can reach it
     mem_limit: 64m

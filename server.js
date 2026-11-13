@@ -47,7 +47,8 @@ const relayed = (m, from) => ({ type: m.type, sdp: m.sdp, candidate: m.candidate
 wss.on('connection', (ws, req) => {
   ws.on('error', () => {}); // a bad socket must never crash the process
 
-  const q = new URL(req.url, 'http://x').searchParams;
+  let q;
+  try { q = new URL(req.url, 'http://x').searchParams; } catch { return ws.close(); } // malformed URL
   const roomId = q.get('room');
   const role = q.get('role') === 'host' ? 'host' : 'viewer';
   const token = q.get('token');
@@ -68,7 +69,10 @@ wss.on('connection', (ws, req) => {
       return ws.close();
     }
     room.hostToken = token;
-    room.host?.terminate(); // same host reconnecting (e.g. page reload): replace the old socket
+    if (room.host) { // same host reconnecting (e.g. page reload): replace the old socket
+      room.host.terminate();
+      room.viewers.forEach((v) => send(v, { type: 'stopped' })); // the old stream is gone
+    }
     room.host = ws;
     room.viewers.forEach((_, id) => send(ws, { type: 'viewer-joined', id }));
   } else {

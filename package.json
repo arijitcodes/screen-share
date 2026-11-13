@@ -1,7 +1,16 @@
 {
-  "name": "screenshare",
+  "name": "screen-share",
   "version": "1.0.0",
+  "description": "Peer-to-peer screen and system-audio sharing over WebRTC, with a tiny signaling server",
   "private": true,
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.18.0" }
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
