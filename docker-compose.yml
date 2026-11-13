@@ -5,5 +5,5 @@ services:
     container_name: screen-share
     restart: unless-stopped
     ports:
-      - "0.0.0.0:3000:3000" # only nginx on the host can reach it
+      - "127.0.0.1:3000:3000" # only nginx on the host can reach it
     mem_limit: 64m
