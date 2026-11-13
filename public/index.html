@@ -22,8 +22,11 @@
 </head>
 <body>
   <h2 id="title">Screen Share</h2>
+
+  <!-- Landing: create a room -->
   <div id="landing" class="hidden"><button id="create">Create room</button></div>
 
+  <!-- Host controls -->
   <div id="host" class="hidden">
     <div class="row"><input id="link"><button id="copy">Copy link</button></div>
     <div class="row">
@@ -36,6 +39,7 @@
     <p class="hint" style="margin-top:10px">Pick <b>Entire screen</b> and tick <b>Share system audio</b>.</p>
   </div>
 
+  <!-- Viewer controls -->
   <div id="viewer" class="hidden">
     <button id="join">Join &amp; watch</button>
     <p class="hint" style="margin-top:10px">Click to join, it also enables sound.</p>
@@ -45,30 +49,189 @@
   <div id="status"></div>
 
 <script>
+// ============ Config ============
+const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+const VIDEO_MAX_BITRATE = 8_000_000; // bits/second, per viewer
+
+// ============ Helpers ============
 const $ = (id) => document.getElementById(id);
-const status = (t) => ($('status').textContent = t);
+const setStatus = (text) => ($('status').textContent = text);
 const show = (id) => $(id).classList.remove('hidden');
 const hide = (id) => $(id).classList.add('hidden');
-const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+const sendJson = (ws, obj) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(obj));
 
-// Stereo + high-bitrate Opus so system audio doesn't sound like a phone call.
+// Edits the connection description so Opus audio is stereo at high bitrate (default is low-bitrate mono).
 const hifi = (sdp) => sdp.replace(/(a=fmtp:\d+ [^\r\n]*useinbandfec=1)/g, '$1;stereo=1;sprop-stereo=1;maxaveragebitrate=510000');
 
-const m = location.pathname.match(/^\/r\/([0-9a-f-]{36})$/);
-const room = m && m[1];
-const isHost = !!room && location.hash === '#host';
-
-function connect(role) {
+function openSocket(room, role, token) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return new WebSocket(`${proto}://${location.host}/?room=${room}&role=${role}`);
+  return new WebSocket(`${proto}://${location.host}/?room=${room}&role=${role}${token ? `&token=${token}` : ''}`);
 }
 
-if (!room) {
+// Sending side: hold ICE candidates back until our offer/answer is sent, so the
+// other side never receives a candidate before the description it belongs to.
+function makeIceOutbox(sendCandidate) {
+  let released = false;
+  const held = [];
+  return {
+    push(c) { released ? sendCandidate(c) : held.push(c); },
+    release() { released = true; held.splice(0).forEach(sendCandidate); },
+  };
+}
+
+// Receiving side: queue candidates that arrive before the remote description is set.
+function makeIceQueue() {
+  const queue = [];
+  const apply = (pc, c) => pc.addIceCandidate(c).catch(() => {});
+  return {
+    add(pc, c) { pc && pc.remoteDescription ? apply(pc, c) : queue.push(c); },
+    flush(pc) { queue.splice(0).forEach((c) => apply(pc, c)); },
+  };
+}
+
+// ============ Pick a mode from the URL ============
+//   /                       -> landing page
+//   /r/<room>#host=<token>  -> host (the token is a secret that only the creator has)
+//   /r/<room>               -> viewer
+const roomMatch = location.pathname.match(/^\/r\/([0-9a-f-]{36})$/);
+const hostMatch = location.hash.match(/^#host=([0-9a-f-]{36})$/);
+if (!roomMatch) startLanding();
+else if (hostMatch) startHost(roomMatch[1], hostMatch[1]);
+else startViewer(roomMatch[1]);
+
+// ============ Landing ============
+function startLanding() {
   show('landing');
-  $('create').onclick = () => { location.href = `/r/${crypto.randomUUID()}#host`; };
-} else if (isHost) {
+  $('create').onclick = () => { location.href = `/r/${crypto.randomUUID()}#host=${crypto.randomUUID()}`; };
+}
+
+// ============ Host ============
+function startHost(room, token) {
   $('title').textContent = 'Hosting';
   show('host');
+  setupShareLink(room);
+
+  const ws = openSocket(room, 'host', token);
+  const send = (obj) => sendJson(ws, obj);
+  const viewers = new Set(); // ids of viewers currently in the room
+  const peers = new Map();   // viewerId -> { pc, ice }: one WebRTC connection per viewer
+  let stream = null;         // the captured screen while sharing
+  let warning = '';          // a problem message that replaces the normal status
+
+  function refreshStatus() {
+    if (warning) return setStatus(warning);
+    if (stream) return setStatus(`Sharing to ${viewers.size} viewer(s)`);
+    setStatus(viewers.size
+      ? `${viewers.size} viewer(s) in the room. Click Start sharing.`
+      : 'Waiting for your friend to open the link…');
+  }
+
+  // Tell the server how many viewers may join.
+  function sendMax() {
+    const custom = $('max').value === 'custom';
+    $('maxcustom').classList.toggle('hidden', !custom);
+    send({ type: 'max', n: +(custom ? $('maxcustom').value : $('max').value) });
+  }
+
+  // Create a connection to one viewer and send them an offer.
+  async function callViewer(id) {
+    peers.get(id)?.pc.close();
+    const pc = new RTCPeerConnection(ICE_CONFIG);
+    const ice = makeIceQueue();
+    const outbox = makeIceOutbox((candidate) => send({ type: 'ice', to: id, candidate }));
+    peers.set(id, { pc, ice });
+
+    pc.onicecandidate = (e) => e.candidate && outbox.push(e.candidate);
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed') { warning = 'A viewer could not connect (their network may block direct connections).'; refreshStatus(); }
+      else if (pc.connectionState === 'connected') { warning = ''; refreshStatus(); }
+    };
+
+    for (const track of stream.getTracks()) {
+      if (track.kind === 'video') {
+        pc.addTransceiver(track, { direction: 'sendonly', streams: [stream], sendEncodings: [{ maxBitrate: VIDEO_MAX_BITRATE }] });
+      } else {
+        pc.addTrack(track, stream);
+      }
+    }
+
+    const offer = await pc.createOffer();
+    offer.sdp = hifi(offer.sdp);
+    await pc.setLocalDescription(offer);
+    send({ type: 'offer', to: id, sdp: pc.localDescription });
+    outbox.release();
+  }
+
+  async function startSharing() {
+    if (stream) return;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 60 },
+        // Turn off voice-call processing so game/music audio isn't mangled.
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
+      });
+    } catch { stream = null; return; } // picker cancelled
+    const video = stream.getVideoTracks()[0];
+    video.contentHint = 'motion'; // prefer keeping resolution and smoothness
+    video.onended = stopSharing;  // the browser's own "Stop sharing" bar
+    warning = stream.getAudioTracks().length ? '' : 'Sharing WITHOUT audio. Stop and re-share with "Share system audio" ticked.';
+    hide('share'); show('stop');
+    refreshStatus();
+    viewers.forEach((id) => callViewer(id).catch(console.error));
+  }
+
+  function stopSharing() {
+    if (!stream) return;
+    send({ type: 'stopped' });
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null; warning = '';
+    peers.forEach(({ pc }) => pc.close());
+    peers.clear();
+    hide('stop'); show('share');
+    refreshStatus();
+  }
+
+  async function onMessage(msg) {
+    const peer = peers.get(msg.from);
+    switch (msg.type) {
+      case 'viewer-joined':
+        viewers.add(msg.id);
+        refreshStatus();
+        if (stream) await callViewer(msg.id); // already sharing: call them right away
+        break;
+      case 'viewer-left':
+        viewers.delete(msg.id);
+        peers.get(msg.id)?.pc.close();
+        peers.delete(msg.id);
+        refreshStatus();
+        break;
+      case 'answer':
+        if (!peer) break;
+        await peer.pc.setRemoteDescription(msg.sdp);
+        peer.ice.flush(peer.pc);
+        break;
+      case 'ice':
+        if (peer) peer.ice.add(peer.pc, msg.candidate);
+        break;
+      case 'error':
+        warning = msg.msg;
+        refreshStatus();
+        break;
+    }
+  }
+
+  ws.onopen = sendMax;
+  ws.onmessage = (e) => onMessage(JSON.parse(e.data)).catch(console.error);
+  ws.onclose = () => { warning = warning || 'Lost connection to the server. Refresh to retry.'; refreshStatus(); };
+  $('max').onchange = sendMax;
+  $('maxcustom').oninput = sendMax;
+  $('share').onclick = startSharing;
+  $('stop').onclick = stopSharing;
+  refreshStatus();
+}
+
+// The link to give your friend. On localhost it uses your LAN IP so other devices can open it.
+function setupShareLink(room) {
   $('link').value = `${location.origin}/r/${room}`;
   if (['localhost', '127.0.0.1'].includes(location.hostname)) {
     fetch('/lan').then((r) => r.json()).then((ips) => {
@@ -77,126 +240,77 @@ if (!room) {
     }).catch(() => {});
   }
   $('copy').onclick = () => {
-    navigator.clipboard.writeText($('link').value);
+    $('link').select();
+    navigator.clipboard?.writeText($('link').value);
     $('copy').textContent = 'Copied!';
     setTimeout(() => ($('copy').textContent = 'Copy link'), 1500);
   };
-  runHost();
-} else {
+}
+
+// ============ Viewer ============
+function startViewer(room) {
   $('title').textContent = 'Watching';
   show('viewer');
-  $('join').onclick = runViewer;
-}
 
-function runHost() {
-  const ws = connect('host');
-  const viewers = new Set();
-  const peers = new Map();
-  let stream = null;
-  let warn = '';
-  const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
-  const refresh = () => status(warn || (stream
-    ? `Sharing to ${viewers.size} viewer(s)`
-    : viewers.size ? `${viewers.size} viewer(s) in the room. Click Start sharing.` : 'Waiting for your friend to open the link…'));
-  const sendMax = () => {
-    const custom = $('max').value === 'custom';
-    $('maxcustom').classList.toggle('hidden', !custom);
-    send({ type: 'max', n: +(custom ? $('maxcustom').value : $('max').value) });
-  };
-  ws.onopen = sendMax;
-  $('max').onchange = sendMax;
-  $('maxcustom').oninput = sendMax;
-  ws.onclose = () => { warn = warn || 'Lost connection to the server. Refresh to retry.'; refresh(); };
-  refresh();
+  $('join').onclick = () => {
+    hide('viewer');
+    setStatus('Connecting…');
+    const ws = openSocket(room, 'viewer');
+    const send = (obj) => sendJson(ws, obj);
+    let pc = null;
+    let ice = makeIceQueue();
+    let finished = false; // true once we know why we're leaving (e.g. room full)
 
-  async function callViewer(id) {
-    peers.get(id)?.close();
-    const pc = new RTCPeerConnection(ICE);
-    peers.set(id, pc);
-    pc.onicecandidate = (e) => e.candidate && send({ type: 'ice', to: id, candidate: e.candidate });
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed') { warn = 'A viewer could not connect (their network may block direct connections).'; refresh(); }
-      else if (pc.connectionState === 'connected') { warn = ''; refresh(); }
-    };
-    for (const t of stream.getTracks()) {
-      if (t.kind === 'video') pc.addTransceiver(t, { direction: 'sendonly', streams: [stream], sendEncodings: [{ maxBitrate: 8_000_000 }] });
-      else pc.addTrack(t, stream);
-    }
-    const offer = await pc.createOffer();
-    offer.sdp = hifi(offer.sdp);
-    await pc.setLocalDescription(offer);
-    send({ type: 'offer', to: id, sdp: pc.localDescription });
-  }
-
-  ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'viewer-joined') { viewers.add(msg.id); refresh(); if (stream) callViewer(msg.id); }
-    else if (msg.type === 'viewer-left') { viewers.delete(msg.id); peers.get(msg.id)?.close(); peers.delete(msg.id); refresh(); }
-    else if (msg.type === 'answer') await peers.get(msg.from)?.setRemoteDescription(msg.sdp);
-    else if (msg.type === 'ice') await peers.get(msg.from)?.addIceCandidate(msg.candidate).catch(() => {});
-    else if (msg.type === 'error') { warn = msg.msg; refresh(); }
-  };
-
-  $('share').onclick = async () => {
-    try {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 60 },
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
-      });
-    } catch { stream = null; return; }
-    const v = stream.getVideoTracks()[0];
-    v.contentHint = 'motion';
-    v.onended = stopSharing;
-    warn = stream.getAudioTracks().length ? '' : 'Sharing WITHOUT audio. Stop and re-share with "Share system audio" ticked.';
-    hide('share'); show('stop');
-    refresh();
-    viewers.forEach(callViewer);
-  };
-
-  function stopSharing() {
-    if (!stream) return;
-    send({ type: 'stopped' });
-    stream.getTracks().forEach((t) => t.stop());
-    stream = null; warn = '';
-    peers.forEach((p) => p.close()); peers.clear();
-    hide('stop'); show('share');
-    refresh();
-  }
-  $('stop').onclick = stopSharing;
-}
-
-function runViewer() {
-  hide('viewer');
-  const ws = connect('viewer');
-  let pc;
-  let ended = false;
-  const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
-  status('Connecting…');
-  ws.onopen = () => status('Connected. Waiting for the host to start sharing…');
-  ws.onclose = () => { if (!ended) status('Disconnected. Refresh to rejoin.'); };
-
-  ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'waiting') status("Connected. The host hasn't opened the room yet, waiting…");
-    else if (msg.type === 'full') { ended = true; status('This room is full.'); }
-    else if (msg.type === 'stopped') { status('The host stopped sharing. Waiting for them to start again…'); pc?.close(); $('vid').srcObject = null; hide('vid'); }
-    else if (msg.type === 'host-left') { status('The host closed the room.'); pc?.close(); $('vid').srcObject = null; hide('vid'); }
-    else if (msg.type === 'offer') {
+    function stopWatching() {
       pc?.close();
-      pc = new RTCPeerConnection(ICE);
-      pc.onicecandidate = (ev) => ev.candidate && send({ type: 'ice', to: 'host', candidate: ev.candidate });
-      pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') status('Could not connect. Your network may block direct connections.'); };
-      pc.ontrack = (ev) => {
-        const v = $('vid');
-        if (v.srcObject !== ev.streams[0]) v.srcObject = ev.streams[0];
-        show('vid'); v.play().catch(() => {}); status('');
+      pc = null;
+      $('vid').srcObject = null;
+      hide('vid');
+    }
+
+    // The host sent an offer: build the connection and answer it.
+    async function onOffer(msg) {
+      pc?.close();
+      pc = new RTCPeerConnection(ICE_CONFIG);
+      ice = makeIceQueue();
+      const outbox = makeIceOutbox((candidate) => send({ type: 'ice', candidate }));
+      const thisPc = pc;
+
+      pc.onicecandidate = (e) => e.candidate && outbox.push(e.candidate);
+      pc.onconnectionstatechange = () => {
+        if (thisPc.connectionState === 'failed') setStatus('Could not connect. Your network may block direct connections.');
       };
+      pc.ontrack = (e) => {
+        const video = $('vid');
+        if (video.srcObject !== e.streams[0]) video.srcObject = e.streams[0];
+        show('vid');
+        video.play().catch(() => {});
+        setStatus('');
+      };
+
       await pc.setRemoteDescription(msg.sdp);
-      const ans = await pc.createAnswer();
-      ans.sdp = hifi(ans.sdp);
-      await pc.setLocalDescription(ans);
+      ice.flush(pc);
+      const answer = await pc.createAnswer();
+      answer.sdp = hifi(answer.sdp);
+      await pc.setLocalDescription(answer);
       send({ type: 'answer', sdp: pc.localDescription });
-    } else if (msg.type === 'ice') await pc?.addIceCandidate(msg.candidate).catch(() => {});
+      outbox.release();
+    }
+
+    async function onMessage(msg) {
+      switch (msg.type) {
+        case 'waiting': setStatus("Connected. The host hasn't opened the room yet, waiting…"); break;
+        case 'full': finished = true; setStatus('This room is full.'); break;
+        case 'offer': await onOffer(msg); break;
+        case 'ice': ice.add(pc, msg.candidate); break;
+        case 'stopped': stopWatching(); setStatus('The host stopped sharing. Waiting for them to start again…'); break;
+        case 'host-left': stopWatching(); setStatus('The host closed the room.'); break;
+      }
+    }
+
+    ws.onopen = () => setStatus('Connected. Waiting for the host to start sharing…');
+    ws.onmessage = (e) => onMessage(JSON.parse(e.data)).catch(console.error);
+    ws.onclose = () => { if (!finished) setStatus('Disconnected. Refresh to rejoin.'); };
   };
 }
 </script>
