@@ -1,5 +1,6 @@
 services:
   screen-share:
+    image: screen-share
     build: .
     container_name: screen-share
     restart: unless-stopped
