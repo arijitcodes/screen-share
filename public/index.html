@@ -22,6 +22,8 @@
   button.secondary { background: #2a2a33; }
   button.stop { background: var(--danger); }
   button.wide { width: 100%; height: 46px; font-size: 15px; }
+  a.btn { display: block; text-align: center; text-decoration: none; background: #2a2a33; color: #fff; border-radius: 8px; padding: 11px; font-size: 14px; font-weight: 600; }
+  a.btn:hover { filter: brightness(1.1); }
   .sub, .hint { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
   .hint { font-size: 13px; }
   video { width: min(1280px, 96vw); max-height: 80dvh; background: #000; border-radius: 10px; }
@@ -50,9 +52,22 @@
       <select id="max"><option>1</option><option>2</option><option>3</option><option>4</option><option value="custom">Custom…</option></select>
       <input id="maxcustom" class="hidden" type="number" min="1" max="50" value="5">
     </div>
+    <div class="field">
+      <label class="label" for="quality" style="flex:1">Quality</label>
+      <select id="quality">
+        <option value="0">1080p smooth (games)</option>
+        <option value="1">1080p sharp (movies)</option>
+        <option value="2">1440p (2K) 60fps</option>
+        <option value="3">4K 30fps</option>
+        <option value="4">4K 60fps (heavy)</option>
+      </select>
+    </div>
+    <p id="qualityHint" class="hint"></p>
     <button id="share" class="wide">Start sharing</button>
     <button id="stop" class="wide stop hidden">Stop sharing</button>
-    <p class="hint">In the picker, choose <b>Entire screen</b> and tick <b>Share system audio</b>.</p>
+    <p class="hint">Playing something in Chrome? Pick <b>Chrome Tab</b> and tick <b>Also share tab audio</b> (no echo). Games and desktop apps: <b>Entire screen</b> + <b>Share system audio</b>.</p>
+    <p id="playerState" class="hint"></p>
+    <a class="btn" href="/player.html" target="_blank" rel="noopener">🎬 Open the movie player (new tab)</a>
   </div>
 
   <!-- Viewer controls -->
@@ -67,7 +82,15 @@
 <script>
 // ============ Config ============
 const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
-const VIDEO_MAX_BITRATE = 8_000_000; // bits/second, per viewer
+// Quality presets: bitrate cap per viewer, capture size limit, frame rate, and how the
+// encoder trades smoothness ('motion') against sharpness ('detail').
+const QUALITY = [
+  { mbps: 8,  w: 1920, h: 1080, fps: 60, hint: 'motion' }, // 1080p smooth (games)
+  { mbps: 8,  w: 1920, h: 1080, fps: 30, hint: 'detail' }, // 1080p sharp (movies)
+  { mbps: 14, w: 2560, h: 1440, fps: 60, hint: 'motion' }, // 1440p (2K) 60fps
+  { mbps: 20, w: 3840, h: 2160, fps: 30, hint: 'detail' }, // 4K 30fps
+  { mbps: 30, w: 3840, h: 2160, fps: 60, hint: 'motion' }, // 4K 60fps
+];
 
 // ============ Helpers ============
 const $ = (id) => document.getElementById(id);
@@ -132,7 +155,32 @@ function startHost(room, token) {
   const viewers = new Set(); // ids of viewers currently in the room
   const peers = new Map();   // viewerId -> { pc, ice }: one WebRTC connection per viewer
   let stream = null;         // the captured screen while sharing
+  let quality = QUALITY[0];  // preset used by the current share
+  const pickedQuality = () => QUALITY[+$('quality').value] || QUALITY[0];
+  const showQualityHint = () => { $('qualityHint').textContent = `Needs about ${pickedQuality().mbps} Mbps of upload per viewer. Pick it before you start sharing.`; };
+  $('quality').onchange = showQualityHint;
+  showQualityHint();
   let warning = '';          // a problem message that replaces the normal status
+
+  // Optional link to the local player tab (/player.html on this same site): lets a viewer's pause button pause your movie.
+  const channel = new BroadcastChannel('screen-share');
+  let playerOn = false, playerTimer = null, lastToggle = 0;
+  const sendPlayerState = () => send({ type: 'player', connected: playerOn });
+  function setPlayer(on) {
+    $('playerState').textContent = on
+      ? 'Player tab connected: your friend can pause for both of you.'
+      : "No player tab open: your friend's pause button is off.";
+    if (on === playerOn) return;
+    playerOn = on;
+    sendPlayerState();
+  }
+  channel.onmessage = (e) => {
+    if (!e.data || e.data.type !== 'alive') return; // the player sends a heartbeat every 2s
+    setPlayer(true);
+    clearTimeout(playerTimer);
+    playerTimer = setTimeout(() => setPlayer(false), 5000);
+  };
+  setPlayer(false);
 
   function refreshStatus() {
     if (warning) return setStatus(warning);
@@ -165,7 +213,7 @@ function startHost(room, token) {
 
     for (const track of stream.getTracks()) {
       if (track.kind === 'video') {
-        pc.addTransceiver(track, { direction: 'sendonly', streams: [stream], sendEncodings: [{ maxBitrate: VIDEO_MAX_BITRATE }] });
+        pc.addTransceiver(track, { direction: 'sendonly', streams: [stream], sendEncodings: [{ maxBitrate: quality.mbps * 1_000_000 }] });
       } else {
         pc.addTrack(track, stream);
       }
@@ -180,17 +228,19 @@ function startHost(room, token) {
 
   async function startSharing() {
     if (stream) return;
+    quality = pickedQuality(); // lock in the preset for this share
     try {
       stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 60 },
+        video: { frameRate: quality.fps, width: { max: quality.w }, height: { max: quality.h } },
         // Turn off voice-call processing so game/music audio isn't mangled.
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
       });
     } catch { stream = null; return; } // picker cancelled
     const video = stream.getVideoTracks()[0];
-    video.contentHint = 'motion'; // prefer keeping resolution and smoothness
+    video.contentHint = quality.hint; // 'motion' keeps it smooth, 'detail' keeps it sharp
     video.onended = stopSharing;  // the browser's own "Stop sharing" bar
     warning = stream.getAudioTracks().length ? '' : 'Sharing WITHOUT audio. Stop and re-share with "Share system audio" ticked.';
+    $('quality').disabled = true; // changing it needs a new capture, so stop and restart to switch
     hide('share'); show('stop');
     refreshStatus();
     viewers.forEach((id) => callViewer(id).catch(console.error));
@@ -203,6 +253,7 @@ function startHost(room, token) {
     stream = null; warning = '';
     peers.forEach(({ pc }) => pc.close());
     peers.clear();
+    $('quality').disabled = false;
     hide('stop'); show('share');
     refreshStatus();
   }
@@ -212,6 +263,7 @@ function startHost(room, token) {
     switch (msg.type) {
       case 'viewer-joined':
         viewers.add(msg.id);
+        sendPlayerState(); // tell the new viewer whether pause is available
         refreshStatus();
         if (stream) await callViewer(msg.id); // already sharing: call them right away
         break;
@@ -229,6 +281,12 @@ function startHost(room, token) {
       case 'ice':
         if (peer) peer.ice.add(peer.pc, msg.candidate);
         break;
+      case 'control': // a viewer asked to pause/play
+        if (msg.action === 'toggle' && playerOn && Date.now() - lastToggle > 400) {
+          lastToggle = Date.now();
+          channel.postMessage({ type: 'toggle' });
+        }
+        break;
       case 'error':
         warning = msg.msg;
         refreshStatus();
@@ -236,7 +294,7 @@ function startHost(room, token) {
     }
   }
 
-  ws.onopen = sendMax;
+  ws.onopen = () => { sendMax(); sendPlayerState(); };
   ws.onmessage = (e) => onMessage(JSON.parse(e.data)).catch(console.error);
   ws.onclose = () => { warning = warning || 'Lost connection to the server. Refresh to retry.'; refreshStatus(); };
   $('max').onchange = sendMax;
@@ -276,6 +334,26 @@ function startViewer(room) {
     let pc = null;
     let ice = makeIceQueue();
     let finished = false; // true once we know why we're leaving (e.g. room full)
+    let playerSync = false; // true while the host's player tab is linked (pause is available)
+    let flashTimer = null;
+
+    // Show a short message, then clear it (unless something else replaced it).
+    function flash(text) {
+      setStatus(text);
+      clearTimeout(flashTimer);
+      flashTimer = setTimeout(() => { if ($('status').textContent === text) setStatus(''); }, 2500);
+    }
+
+    // Her pause button can't really pause a live stream. Keep her view live and,
+    // if the host's player is linked, ask the host to pause/play for both of you.
+    function onViewerPause() {
+      const video = $('vid');
+      if (!video.srcObject) return; // stream was torn down, not a user action
+      video.play().catch(() => {});
+      if (document.visibilityState !== 'visible') return; // phone locked / tab hidden: not a real request
+      if (playerSync) { send({ type: 'control', action: 'toggle' }); flash('Pause / play request sent.'); }
+      else flash("Pause isn't available for this share.");
+    }
 
     function stopWatching() {
       pc?.close();
@@ -301,6 +379,7 @@ function startViewer(room) {
           video.srcObject = e.streams[0];
           video.muted = false;
           video.onvolumechange = () => { if (!video.muted) setStatus(''); };
+          video.onpause = onViewerPause;
           setStatus('');
           video.play().catch(() => {
             video.muted = true; // some browsers (iOS/Safari) only autoplay muted
@@ -334,6 +413,7 @@ function startViewer(room) {
         case 'offer': await onOffer(msg); break;
         case 'ice': ice.add(pc, msg.candidate); break;
         case 'stopped': stopWatching(); setStatus('The host stopped sharing. Waiting for them to start again…'); break;
+        case 'player': playerSync = !!msg.connected; break;
         case 'host-left': stopWatching(); setStatus('The host closed the room.'); break;
       }
     }

@@ -15,11 +15,14 @@ const MAX_VIEWERS_LIMIT = 50;
 
 // Handshake message types each side may send. Anything else is dropped.
 const HOST_RELAY = new Set(['offer', 'ice']);
-const VIEWER_RELAY = new Set(['answer', 'ice']);
+const VIEWER_RELAY = new Set(['answer', 'ice', 'control']); // 'control' = a viewer's pause/play request
 
 // ---------- Web server: serves the single page ----------
 const pagePath = [path.join(__dirname, 'public', 'index.html'), path.join(__dirname, 'index.html')].find(fs.existsSync);
 const page = fs.readFileSync(pagePath);
+// Optional local video player page, served at /player.html when the file exists.
+const playerPath = [path.join(__dirname, 'public', 'player.html'), path.join(__dirname, 'player.html')].find(fs.existsSync);
+const player = playerPath && fs.readFileSync(playerPath);
 
 // /lan is only answered when the page was opened via localhost (not via your public domain).
 const isLocalhost = (req) => /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(req.headers.host || '');
@@ -30,6 +33,10 @@ const server = http.createServer((req, res) => {
       .filter((i) => i.family === 'IPv4' && !i.internal).map((i) => i.address);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(ips));
+  }
+  if (req.url === '/player.html' && player) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(player);
   }
   // Every other URL (/, /r/<uuid>) gets the same page; its script reads the URL to pick a mode.
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -42,7 +49,11 @@ const rooms = new Map(); // roomId -> { host, hostToken, viewers: Map<id, ws>, m
 
 const send = (ws, msg) => ws && ws.readyState === 1 && ws.send(JSON.stringify(msg));
 // Rebuild a handshake message from known fields only, and stamp who sent it.
-const relayed = (m, from) => ({ type: m.type, sdp: m.sdp, candidate: m.candidate, from });
+const relayed = (m, from) => ({
+  type: m.type, sdp: m.sdp, candidate: m.candidate,
+  action: typeof m.action === 'string' ? m.action.slice(0, 16) : undefined,
+  from,
+});
 
 wss.on('connection', (ws, req) => {
   ws.on('error', () => {}); // a bad socket must never crash the process
@@ -91,6 +102,7 @@ wss.on('connection', (ws, req) => {
       if (ws !== room.host) return; // stale socket that was replaced
       if (m.type === 'max') room.max = Math.min(Math.max(parseInt(m.n) || 1, 1), MAX_VIEWERS_LIMIT);
       else if (m.type === 'stopped') room.viewers.forEach((v) => send(v, { type: 'stopped' }));
+      else if (m.type === 'player') room.viewers.forEach((v) => send(v, { type: 'player', connected: !!m.connected })); // is the host's player tab linked?
       else if (HOST_RELAY.has(m.type)) send(room.viewers.get(m.to), relayed(m, 'host'));
     } else if (VIEWER_RELAY.has(m.type)) {
       send(room.host, relayed(m, ws.id));

@@ -89,6 +89,18 @@ const toggleBar = () => $('bar').classList.toggle('hidden');
 $('h').onclick = toggleBar;
 addEventListener('keydown', (e) => { if (e.key.toLowerCase() === 'h' && !/INPUT/.test(e.target.tagName)) toggleBar(); });
 applySize();
+
+// Link to the host page (same site only): heartbeat so it knows we're here, and obey its pause/play requests.
+try {
+  const channel = new BroadcastChannel('screen-share');
+  channel.onmessage = (e) => {
+    if (!e.data || e.data.type !== 'toggle') return;
+    if (vid.paused) vid.play().catch(() => {}); else vid.pause();
+  };
+  const alive = () => channel.postMessage({ type: 'alive' });
+  alive();
+  setInterval(alive, 2000);
+} catch {}
 </script>
 </body>
 </html>

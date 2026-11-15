@@ -20,11 +20,13 @@ So this is a ~400-line WebRTC app that has none of those limits.
 
 - 🔗 **One-link rooms**: a random UUID per room, nothing to sign up for
 - 🔊 **System audio**: games, media players, browser, all of it (stereo, high-bitrate Opus)
-- 🎞️ **Up to 1080p60**: video bitrate capped at 8 Mbps per viewer, tuned for motion
+- 🎞️ **Quality presets** (1080p, 1440p, 4K), picked on the host page (bitrate cap, frame rate and sharpness adapt)
 - 🔒 **Peer-to-peer and encrypted**: video and audio never touch the server
 - 👥 **Choose how many viewers** (1 to 4, or a custom number up to 50)
 - 🪶 **Tiny**: one dependency (`ws`), no build step, plain HTML/JS on the page
 - 🔐 **Host token**: only the room's creator can host it, the viewer link can't hijack a room
+- 🎬 **Built-in local player** (`/player.html`) with subtitles (SRT/VTT), sync and size controls, for movie nights
+- ⏯️ **Pause for both**: with the player open, your friend's pause button pauses your movie (otherwise it's switched off, so nothing half-works)
 - 🐳 **Docker + nginx ready** for a small VPS
 
 ## 🧠 How it works
@@ -72,16 +74,37 @@ npm start
 **Host** (desktop **Chrome or Edge**):
 
 1. Create a room and send the link.
-2. Choose **Max viewers** if you want more than one person.
+2. Choose **Max viewers** if you want more than one person, and a **Quality** preset. 4K needs roughly 20-30 Mbps of upload per viewer plus a strong PC, and the shared screen or tab has to be 4K to benefit.
 3. Click **Start sharing**, pick **Entire screen**, and tick **Share system audio**.
 
 **Viewer** (any modern browser, phones included): open the link, click **Join & watch**. That click also lets the browser play sound.
 
 ### 🔈 Audio notes
 
+- **Playing it in Chrome?** Share the **Chrome Tab** with **tab audio**. Only that tab's sound is sent, so there's no Discord echo and no extra lag.
 - Window and tab shares can't carry audio from other apps. To share a game or VLC, share the **entire screen** with system audio on.
 - System audio capture includes **everything you hear**, including a Discord call on the same PC, so your friend would hear themselves. Keep the call on another device (e.g. your phone), or route it to a different output.
 - Hosting from Firefox or mobile browsers isn't supported (no system audio, or no screen capture at all).
+
+### 🎬 Watching a movie together
+
+1. On the host page, click **Open the movie player** (or go to `/player.html` on the app, e.g. `https://share.yourdomain.com/player.html`) in a Chrome tab.
+2. Pick the video, then a `.srt` or `.vtt` subtitle file. **Sync -/+0.5s** and **Reset** fix timing, **A-/A+** changes the subtitle size, and **H** hides the top bar.
+3. On the host page, click **Start sharing**, choose **Chrome Tab**, select the player tab and tick **Also share tab audio**.
+
+**Pause for both:** keep the player open from the same site as the host page. The host page then shows *Player tab connected*, and when your friend presses pause or play, your movie does too. With no player tab open (YouTube, VLC, games), her pause button is switched off and she stays live with you.
+
+**Preparing files:** Chrome can't decode E-AC-3 (Dolby Digital Plus) audio and can't read subtitles stored inside a video file. Fix both once with [ffmpeg](https://ffmpeg.org):
+
+```bash
+# keep the video, convert the audio to AAC stereo
+ffmpeg -i movie.mkv -map 0:v:0 -map 0:a:0 -c:v copy -c:a aac -b:a 192k -ac 2 -movflags +faststart movie.mp4
+
+# extract the first embedded text subtitle track
+ffmpeg -i movie.mkv -map 0:s:0 movie.srt
+```
+
+Picture-based subtitles (PGS, DVD) can't be converted to text this way.
 
 ## 🌐 Deploy to a server (Docker + nginx)
 
@@ -109,7 +132,7 @@ sudo certbot --nginx -d share.yourdomain.com
 | What | Where | Default |
 | --- | --- | --- |
 | Server port | `PORT` env var | `3000` |
-| Video bitrate cap (per viewer) | `VIDEO_MAX_BITRATE` in `public/index.html` | `8_000_000` |
+| Quality presets (bitrate, size, fps) | `QUALITY` in `public/index.html` | 1080p smooth (8 Mbps, 60 fps) |
 | Max viewers | Host page dropdown (server limit in `server.js`) | `1` (up to `50`) |
 | STUN servers | `ICE_CONFIG` in `public/index.html` | Google public STUN |
 
@@ -121,7 +144,8 @@ sudo certbot --nginx -d share.yourdomain.com
 screen-share/
 ├── server.js               # web server + WebSocket signaling (rooms, relay rules)
 ├── public/
-│   └── index.html          # the whole UI and the WebRTC client (host + viewer)
+│   ├── index.html          # the UI and the WebRTC client (host + viewer)
+│   └── player.html         # local video player: subtitles + pause sync
 ├── Dockerfile
 ├── docker-compose.yml
 ├── screenshare.nginx.conf  # nginx site config (WebSocket proxy)
@@ -149,6 +173,10 @@ screen-share/
 | "Could not connect" | A network is blocking direct connections, add a TURN server |
 | Video starts muted on a phone | The browser blocked autoplay sound, tap the video's unmute button |
 | **Create room** does nothing | Open the app via `localhost` or HTTPS (needs a secure origin) |
+| No sound in the local player | The file's audio codec (often E-AC-3) isn't supported by Chrome, convert it with ffmpeg (see above) |
+| Subtitles inside the video don't show | Browsers can't read embedded subtitles, extract them to `.srt` with ffmpeg |
+| Picture is soft at the start | Normal, WebRTC starts low and ramps up over 10-30 s. Share a large tab or window and pick a higher **Quality** preset |
+| Friend's pause button does nothing | Pause only works with the player open from the same site as the host page (`/player.html`), the host page shows when it's connected |
 
 ## 🚨 Slop Declaration
 
