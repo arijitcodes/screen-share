@@ -25,6 +25,7 @@ So this is a ~400-line WebRTC app that has none of those limits.
 - 👥 **Choose how many viewers** (1 to 4, or a custom number up to 50)
 - 🪶 **Tiny**: one dependency (`ws`), no build step, plain HTML/JS on the page
 - 🔐 **Host token**: only the room's creator can host it, the viewer link can't hijack a room
+- 📊 **Live ping and quality stats** on both sides (resolution, fps, bitrate, packet loss)
 - 🎬 **Built-in local player** (`/player.html`) with subtitles (SRT/VTT), sync and size controls, for movie nights
 - ⏯️ **Pause for both**: with the player open, your friend's pause button pauses your movie (otherwise it's switched off, so nothing half-works)
 - 🐳 **Docker + nginx ready** for a small VPS
@@ -85,6 +86,10 @@ npm start
 - Window and tab shares can't carry audio from other apps. To share a game or VLC, share the **entire screen** with system audio on.
 - System audio capture includes **everything you hear**, including a Discord call on the same PC, so your friend would hear themselves. Keep the call on another device (e.g. your phone), or route it to a different output.
 - Hosting from Firefox or mobile browsers isn't supported (no system audio, or no screen capture at all).
+
+### 📊 Ping and quality
+
+Both sides see live stats under the video: ping (the network round trip), resolution, fps, bitrate, packet loss, and whether Chrome is lowering quality because of bandwidth or CPU. The host sees one line per viewer. The real delay you perceive is usually 100-300 ms higher than the ping, because of capture, encoding and decoding.
 
 ### 🎬 Watching a movie together
 

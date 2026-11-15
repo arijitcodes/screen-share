@@ -29,6 +29,8 @@
   video { width: min(1280px, 96vw); max-height: 80dvh; background: #000; border-radius: 10px; }
   #status { color: #c9c9d3; font-size: 14px; background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 7px 16px; text-align: center; }
   #status:empty { display: none; }
+  #stats { white-space: pre-line; text-align: center; }
+  #stats:empty { display: none; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -78,6 +80,7 @@
 
   <video id="vid" class="hidden" autoplay playsinline controls></video>
   <div id="status" aria-live="polite"></div>
+  <div id="stats" class="hint"></div>
 
 <script>
 // ============ Config ============
@@ -126,6 +129,48 @@ function makeIceQueue() {
     add(pc, c) { pc && pc.remoteDescription ? apply(pc, c) : queue.push(c); },
     flush(pc) { queue.splice(0).forEach((c) => apply(pc, c)); },
   };
+}
+
+// ============ Connection stats (ping + quality) ============
+// Reads one video connection's WebRTC stats. `prev` is the previous sample ({ bytes, time }), used to work out bitrate.
+async function readStats(pc, prev) {
+  const out = { rtt: null, width: null, height: null, fps: null, kbps: null, loss: null, limit: null, next: null };
+  let bytes = null;
+  const report = await pc.getStats();
+  report.forEach((s) => {
+    if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded' && s.currentRoundTripTime != null) {
+      out.rtt = Math.round(s.currentRoundTripTime * 1000); // network round trip, ms
+      return;
+    }
+    if ((s.kind || s.mediaType) !== 'video') return;
+    if (s.type === 'outbound-rtp') { // host: what we're sending
+      Object.assign(out, { width: s.frameWidth, height: s.frameHeight, fps: s.framesPerSecond, limit: s.qualityLimitationReason });
+      bytes = s.bytesSent;
+    } else if (s.type === 'inbound-rtp') { // viewer: what we're receiving
+      Object.assign(out, { width: s.frameWidth, height: s.frameHeight, fps: s.framesPerSecond });
+      bytes = s.bytesReceived;
+      const total = s.packetsReceived + s.packetsLost;
+      if (total > 0) out.loss = (s.packetsLost / total) * 100;
+    } else if (s.type === 'remote-inbound-rtp' && s.fractionLost != null) { // host: loss as the viewer sees it
+      out.loss = s.fractionLost * 100;
+    }
+  });
+  if (bytes != null) {
+    const now = Date.now();
+    if (prev && bytes >= prev.bytes && now > prev.time) out.kbps = Math.round(((bytes - prev.bytes) * 8) / (now - prev.time)); // bits per ms = kbps
+    out.next = { bytes, time: now };
+  }
+  return out;
+}
+
+function formatStats(st) {
+  const parts = [st.rtt != null ? `ping ${st.rtt} ms` : 'ping …'];
+  if (st.width) parts.push(`${st.width}×${st.height}`);
+  if (st.fps) parts.push(`${Math.round(st.fps)} fps`);
+  if (st.kbps != null) parts.push(`${(st.kbps / 1000).toFixed(1)} Mbps`);
+  if (st.loss != null) parts.push(`loss ${st.loss.toFixed(1)}%`);
+  if (st.limit && st.limit !== 'none') parts.push(`limited by ${st.limit}`);
+  return parts.join(' · ');
 }
 
 // ============ Pick a mode from the URL ============
@@ -182,6 +227,30 @@ function startHost(room, token) {
   };
   setPlayer(false);
 
+  // Live ping + quality per viewer (shown under the status line).
+  const prevStats = new Map();    // viewerId -> previous { bytes, time } sample
+  const viewerNumber = new Map(); // viewerId -> 1, 2, 3... in join order
+  let nextViewerNumber = 1, statsBusy = false;
+  async function updateStats() {
+    if (statsBusy) return;
+    statsBusy = true;
+    try {
+      const lines = [];
+      if (stream) {
+        for (const [id, { pc }] of peers) {
+          if (pc.connectionState !== 'connected') continue;
+          try {
+            const st = await readStats(pc, prevStats.get(id));
+            if (st.next) prevStats.set(id, st.next);
+            lines.push((viewers.size > 1 ? `Viewer ${viewerNumber.get(id)}: ` : '') + formatStats(st));
+          } catch {}
+        }
+      }
+      $('stats').textContent = lines.join('\n');
+    } finally { statsBusy = false; }
+  }
+  setInterval(updateStats, 2000);
+
   function refreshStatus() {
     if (warning) return setStatus(warning);
     if (stream) return setStatus(`Sharing to ${viewers.size} viewer(s)`);
@@ -200,6 +269,7 @@ function startHost(room, token) {
   // Create a connection to one viewer and send them an offer.
   async function callViewer(id) {
     peers.get(id)?.pc.close();
+    prevStats.delete(id); // new connection, new byte counters
     const pc = new RTCPeerConnection(ICE_CONFIG);
     const ice = makeIceQueue();
     const outbox = makeIceOutbox((candidate) => send({ type: 'ice', to: id, candidate }));
@@ -263,6 +333,7 @@ function startHost(room, token) {
     switch (msg.type) {
       case 'viewer-joined':
         viewers.add(msg.id);
+        if (!viewerNumber.has(msg.id)) viewerNumber.set(msg.id, nextViewerNumber++);
         sendPlayerState(); // tell the new viewer whether pause is available
         refreshStatus();
         if (stream) await callViewer(msg.id); // already sharing: call them right away
@@ -335,6 +406,18 @@ function startViewer(room) {
     let ice = makeIceQueue();
     let finished = false; // true once we know why we're leaving (e.g. room full)
     let playerSync = false; // true while the host's player tab is linked (pause is available)
+    let prevStats = null;
+
+    // Live ping + quality of what we're receiving.
+    async function updateStats() {
+      if (!pc || pc.connectionState !== 'connected') { $('stats').textContent = ''; return; }
+      try {
+        const st = await readStats(pc, prevStats);
+        prevStats = st.next || prevStats;
+        $('stats').textContent = formatStats(st);
+      } catch {}
+    }
+    setInterval(updateStats, 2000);
     let flashTimer = null;
 
     // Show a short message, then clear it (unless something else replaced it).
@@ -359,12 +442,14 @@ function startViewer(room) {
       pc?.close();
       pc = null;
       $('vid').srcObject = null;
+      $('stats').textContent = '';
       hide('vid');
     }
 
     // The host sent an offer: build the connection and answer it.
     async function onOffer(msg) {
       pc?.close();
+      prevStats = null;
       const thisPc = (pc = new RTCPeerConnection(ICE_CONFIG));
       const thisIce = (ice = makeIceQueue());
       const outbox = makeIceOutbox((candidate) => send({ type: 'ice', candidate }));
