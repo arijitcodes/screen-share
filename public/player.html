@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Player</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; background: #000; color: #ddd; }
+  #bar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 8px 12px; background: #18181d; font-size: 13px; }
+  #bar.hidden { display: none; }
+  button { background: #2a2a33; color: #fff; border: 0; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  video { flex: 1; min-height: 0; width: 100%; background: #000; }
+</style>
+<style id="cuestyle"></style>
+</head>
+<body>
+  <div id="bar">
+    <label>Video <input type="file" id="v" accept="video/*,.mkv,.mp4,.webm,.avi"></label>
+    <label>Subtitles <input type="file" id="s" accept=".srt,.vtt"></label>
+    <span>Sync <button id="m">-0.5s</button> <b id="o">0.0s</b> <button id="p">+0.5s</button> <button id="r">Reset</button></span>
+    <span>Size <button id="sm">A-</button> <button id="sp">A+</button></span>
+    <button id="h">Hide bar (H)</button>
+  </div>
+  <video id="vid" controls></video>
+
+<script>
+// ---pure--- (subtitle conversion)
+const pad = (n, l = 2) => String(n).padStart(l, '0');
+function fmt(t) {
+  const total = Math.max(0, Math.round(t * 1000));
+  const ms = total % 1000, s = Math.floor(total / 1000) % 60, m = Math.floor(total / 60000) % 60, h = Math.floor(total / 3600000);
+  return `${pad(h)}:${pad(m)}:${pad(s)}.${pad(ms, 3)}`;
+}
+const toSec = (h, m, s, frac) => +h * 3600 + +m * 60 + +s + +('0.' + frac);
+function parseSrt(text) {
+  const cues = [];
+  text = text.replace(/^\uFEFF/, '').replace(/\r/g, '');
+  for (const block of text.split(/\n{2,}/)) {
+    const lines = block.split('\n');
+    const i = lines.findIndex((l) => l.includes('-->'));
+    if (i < 0) continue;
+    const m = lines[i].match(/(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)/);
+    if (!m) continue;
+    const body = lines.slice(i + 1).join('\n').replace(/<\/?font[^>]*>/g, '').replace(/\{\\[^}]*\}/g, '').trim();
+    if (body) cues.push({ start: toSec(m[1], m[2], m[3], m[4]), end: toSec(m[5], m[6], m[7], m[8]), text: body });
+  }
+  return cues;
+}
+function buildVtt(cues, offset) {
+  const out = cues.filter((c) => c.end + offset > 0)
+    .map((c, i) => `${i + 1}\n${fmt(c.start + offset)} --> ${fmt(c.end + offset)}\n${c.text}\n`);
+  return 'WEBVTT\n\n' + out.join('\n');
+}
+// ---end pure---
+
+const $ = (id) => document.getElementById(id);
+const vid = $('vid');
+let cues = [], offset = 0, size = 100;
+
+function applySubs() {
+  vid.querySelectorAll('track').forEach((t) => { URL.revokeObjectURL(t.src); t.remove(); });
+  if (!cues.length) return;
+  const t = document.createElement('track');
+  t.kind = 'subtitles'; t.label = 'Subtitles'; t.default = true;
+  t.src = URL.createObjectURL(new Blob([buildVtt(cues, offset)], { type: 'text/vtt' }));
+  t.addEventListener('load', () => (t.track.mode = 'showing'));
+  vid.appendChild(t);
+  t.track.mode = 'showing';
+}
+function applySize() { $('cuestyle').textContent = `video::cue { font-size: ${size}%; }`; }
+
+$('v').onchange = (e) => { const f = e.target.files[0]; if (f) { vid.src = URL.createObjectURL(f); vid.play().catch(() => {}); } };
+$('s').onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  cues = parseSrt(await f.text());
+  offset = 0; $('o').textContent = '0.0s';
+  applySubs();
+};
+const nudge = (d) => { offset = Math.round((offset + d) * 10) / 10; $('o').textContent = (offset > 0 ? '+' : '') + offset.toFixed(1) + 's'; applySubs(); };
+$('m').onclick = () => nudge(-0.5);
+$('p').onclick = () => nudge(0.5);
+$('r').onclick = () => nudge(-offset);
+$('sm').onclick = () => { size = Math.max(50, size - 15); applySize(); };
+$('sp').onclick = () => { size += 15; applySize(); };
+const toggleBar = () => $('bar').classList.toggle('hidden');
+$('h').onclick = toggleBar;
+addEventListener('keydown', (e) => { if (e.key.toLowerCase() === 'h' && !/INPUT/.test(e.target.tagName)) toggleBar(); });
+applySize();
+</script>
+</body>
+</html>
