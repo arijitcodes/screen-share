@@ -94,8 +94,12 @@ applySize();
 try {
   const channel = new BroadcastChannel('screen-share');
   channel.onmessage = (e) => {
-    if (!e.data || e.data.type !== 'toggle') return;
-    if (vid.paused) vid.play().catch(() => {}); else vid.pause();
+    if (!e.data) return;
+    if (e.data.type === 'toggle') {
+      if (vid.paused) vid.play().catch(() => {}); else vid.pause();
+    } else if (e.data.type === 'seek' && Number.isFinite(e.data.delta)) {
+      vid.currentTime = Math.max(0, Math.min(vid.duration || Infinity, vid.currentTime + e.data.delta));
+    }
   };
   const alive = () => channel.postMessage({ type: 'alive' });
   alive();

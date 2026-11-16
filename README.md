@@ -27,7 +27,7 @@ So this is a ~400-line WebRTC app that has none of those limits.
 - 🔐 **Host token**: only the room's creator can host it, the viewer link can't hijack a room
 - 📊 **Live ping and quality stats** on both sides (resolution, fps, bitrate, packet loss)
 - 🎬 **Built-in local player** (`/player.html`) with subtitles (SRT/VTT), sync and size controls, for movie nights
-- ⏯️ **Pause for both**: with the player open, your friend's pause button pauses your movie (otherwise it's switched off, so nothing half-works)
+- ⏯️ **Pause and skip for both**: with the player open, your friend's pause button and skip buttons (±10 s, ±30 s, or the arrow keys) control your movie (otherwise they're switched off, so nothing half-works)
 - 🐳 **Docker + nginx ready** for a small VPS
 
 ## 🧠 How it works
@@ -97,7 +97,7 @@ Both sides see live stats under the video: ping (the network round trip), resolu
 2. Pick the video, then a `.srt` or `.vtt` subtitle file. **Sync -/+0.5s** and **Reset** fix timing, **A-/A+** changes the subtitle size, and **H** hides the top bar.
 3. On the host page, click **Start sharing**, choose **Chrome Tab**, select the player tab and tick **Also share tab audio**.
 
-**Pause for both:** keep the player open from the same site as the host page. The host page then shows *Player tab connected*, and when your friend presses pause or play, your movie does too. With no player tab open (YouTube, VLC, games), her pause button is switched off and she stays live with you.
+**Pause for both:** keep the player open from the same site as the host page. The host page then shows *Player tab connected*, and when your friend presses pause, play or a skip button (-30 s, -10 s, +10 s, +30 s, or the left/right arrow keys), your movie does the same. With no player tab open (YouTube, VLC, games), her pause button is switched off and she stays live with you.
 
 **Preparing files:** Chrome can't decode E-AC-3 (Dolby Digital Plus) audio and can't read subtitles stored inside a video file. Fix both once with [ffmpeg](https://ffmpeg.org):
 
