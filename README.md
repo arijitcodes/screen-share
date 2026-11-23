@@ -26,7 +26,7 @@ So this is a ~400-line WebRTC app that has none of those limits.
 - 🪶 **Tiny**: one dependency (`ws`), no build step, plain HTML/JS on the page
 - 🔐 **Host token**: only the room's creator can host it, the viewer link can't hijack a room
 - 📊 **Live ping and quality stats** on both sides (resolution, fps, bitrate, packet loss)
-- 🎬 **Built-in local player** (`/player.html`) with subtitles (SRT/VTT), sync and size controls, for movie nights
+- 🎬 **Built-in local player** (`/player.html`) with SRT/VTT and embedded MKV subtitles (picked up automatically), sync and size controls, for movie nights
 - ⏯️ **Pause and skip for both**: with the player open, your friend's pause button and skip buttons (±10 s, ±30 s, or the arrow keys) control your movie (otherwise they're switched off, so nothing half-works)
 - 🐳 **Docker + nginx ready** for a small VPS
 
@@ -99,13 +99,17 @@ Both sides see live stats under the video: ping (the network round trip), resolu
 
 **Pause for both:** keep the player open from the same site as the host page. The host page then shows *Player tab connected*, and when your friend presses pause, play or a skip button (-30 s, -10 s, +10 s, +30 s, or the left/right arrow keys), your movie does the same. With no player tab open (YouTube, VLC, games), her pause button is switched off and she stays live with you.
 
-**Preparing files:** Chrome can't decode E-AC-3 (Dolby Digital Plus) audio and can't read subtitles stored inside a video file. Fix both once with [ffmpeg](https://ffmpeg.org):
+**Subtitles:** for MKV files, the player scans the file once when you open it, lists every embedded text subtitle track in the **Embedded** dropdown and picks the normal English one automatically. Image-based subtitles (PGS, DVD) can't be shown, so use an external `.srt` for those. Loading an external `.srt` still works and replaces the embedded one.
+
+**Audio tracks:** Chrome plays only a file's first audio track. If you turn on Chrome's experimental web platform features flag, an **Audio** dropdown appears for files with more than one.
+
+**Preparing files:** Chrome can't decode some audio formats (such as E-AC-3, Dolby Digital Plus). Convert it once with [ffmpeg](https://ffmpeg.org):
 
 ```bash
 # keep the video, convert the audio to AAC stereo
 ffmpeg -i movie.mkv -map 0:v:0 -map 0:a:0 -c:v copy -c:a aac -b:a 192k -ac 2 -movflags +faststart movie.mp4
 
-# extract the first embedded text subtitle track
+# optional: export a subtitle track to a .srt yourself
 ffmpeg -i movie.mkv -map 0:s:0 movie.srt
 ```
 
@@ -179,7 +183,7 @@ screen-share/
 | Video starts muted on a phone | The browser blocked autoplay sound, tap the video's unmute button |
 | **Create room** does nothing | Open the app via `localhost` or HTTPS (needs a secure origin) |
 | No sound in the local player | The file's audio codec (often E-AC-3) isn't supported by Chrome, convert it with ffmpeg (see above) |
-| Subtitles inside the video don't show | Browsers can't read embedded subtitles, extract them to `.srt` with ffmpeg |
+| Subtitles inside the video don't show | Only text subtitles in MKV/WebM files are read (pick the track in the **Embedded** dropdown). Image-based ones (PGS, DVD) need an external `.srt` |
 | Picture is soft at the start | Normal, WebRTC starts low and ramps up over 10-30 s. Share a large tab or window and pick a higher **Quality** preset |
 | Friend's pause button does nothing | Pause only works with the player open from the same site as the host page (`/player.html`), the host page shows when it's connected |
 
